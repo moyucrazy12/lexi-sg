@@ -1,13 +1,17 @@
 import logging
+import hashlib
+import json
+from pathlib import Path
 
 from lexisg.utils.data_loader import lookup_priors
+from lexisg.utils.room_boundaries import load_external_boundaries, sequence_paths, transition_source
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
 class RoomSegmentation:
-    def __init__(self, model, config):
+    def __init__(self, model, config, boundary_plan=None):
 
         self.corridor_confidence = 0
         self.in_doorway = False
@@ -16,17 +20,27 @@ class RoomSegmentation:
         self.segment_type = None
 
         self.model = model
+        self.settings = config["room_segmentation"]
+        self.source = transition_source(self.settings)
+        self.boundary_plan = boundary_plan
+        self._rgb_paths = None
+        self._frame_lookup = {}
+        self._next_frame_index = 0
+        self._boundary_indices = set()
+        self._batches = []
+        self._assigned_frames = set()
 
-        self.method = config["room_segmentation"]["method"]
-        self.enter_confidence = config["room_segmentation"]["enter_confidence"]
-        self.exit_confidence = config["room_segmentation"]["exit_confidence"]
-        self.enter_threshold = config["room_segmentation"]["enter_threshold"]
-        self.exit_threshold = config["room_segmentation"]["exit_threshold"]
+        if self.source == "native":
+            self.method = config["room_segmentation"]["method"]
+            self.enter_confidence = config["room_segmentation"]["enter_confidence"]
+            self.exit_confidence = config["room_segmentation"]["exit_confidence"]
+            self.enter_threshold = config["room_segmentation"]["enter_threshold"]
+            self.exit_threshold = config["room_segmentation"]["exit_threshold"]
         # If False, transition segments (e.g. doorways) are not emitted as their
         # own nodes: their frames are split at the midpoint between the room
         # being left and the room being entered. Keep True for transitions that
         # are real spaces in their own right (e.g. corridors).
-        self.transitions_as_nodes = bool(config["room_segmentation"].get("transitions_as_nodes", True))
+        self.transitions_as_nodes = self.source == "native" and bool(self.settings.get("transitions_as_nodes", True))
         self._transition_start = None  # index into current_batch where the current transition began
         self.transition_frames = set()  # frames accumulated while inside a folded transition
         self.intrinsics = None
@@ -34,13 +48,89 @@ class RoomSegmentation:
         self.conf_threshold = 0.0
         self.depth_by_rgb = None
         self.pose_by_rgb = None
-    
+
+    def configure_sequence(self, rgb_paths):
+        """Bind external indices and run diagnostics to the actual sorted input."""
+        if self._rgb_paths is not None:
+            raise RuntimeError("Room segmentation is already bound to a sequence")
+        self._rgb_paths = list(rgb_paths)
+        self._frame_lookup = {path: index for index, path in enumerate(rgb_paths)}
+        if self.source == "external":
+            if self.boundary_plan is None:
+                self.boundary_plan = load_external_boundaries(self.settings, rgb_paths)
+            if self.boundary_plan.rgb_paths != sequence_paths(rgb_paths):
+                raise ValueError("RGB sequence changed since external boundaries were validated")
+            self._boundary_indices = set(self.boundary_plan.indices)
+        logger.info("Room transition source=%s, boundary_file=%s, external boundary indices=%s",
+                    self.source, self.boundary_plan.boundary_file if self.boundary_plan else None,
+                    sorted(self._boundary_indices))
+
+    def _estimate_external_batch(self, img_path, end_of_sequence):
+        if self._rgb_paths is None:
+            raise RuntimeError("Call configure_sequence before using external transitions")
+        if end_of_sequence:
+            if self._next_frame_index != len(self._rgb_paths):
+                raise ValueError("External segmentation ended before all RGB frames were consumed")
+            if not self.current_batch:
+                return False, None, None
+            batch = self.current_batch
+            self.current_batch = []
+            return True, batch, ("room", self.batch_index)
+        index = self._next_frame_index
+        if index >= len(self._rgb_paths) or img_path != self._rgb_paths[index]:
+            raise ValueError("External transitions must consume the validated RGB sequence in order")
+        self._next_frame_index += 1
+        if index in self._boundary_indices:
+            batch = self.current_batch
+            key = ("room", self.batch_index)
+            self.current_batch = [img_path]  # The boundary frame belongs only to the new room.
+            self.batch_index += 1
+            return True, batch, key
+        self.current_batch.append(img_path)
+        return False, None, None
+
+    def record_batch(self, batch, key):
+        """Record batches actually submitted to the shared reconstruction backend."""
+        indices = [self._frame_lookup[path] for path in batch]
+        self._assigned_frames.update(indices)
+        self._batches.append({
+            "batch_index": int(key[1]), "label": key[0],
+            "start_frame": indices[0], "end_frame_exclusive": indices[-1] + 1,
+            "num_frames": len(indices),
+            "first_image": Path(batch[0]).name, "last_image": Path(batch[-1]).name,
+        })
+        logger.info("Room batch %d (%s): frames [%d, %d), count=%d", key[1], key[0],
+                    indices[0], indices[-1] + 1, len(indices))
+
+    def save_summary(self, output_folder, complete=False):
+        names = [Path(path).name for path in self._rgb_paths]
+        boundaries = [{"frame_index": batch["start_frame"], "image_name": batch["first_image"]}
+                      for batch in self._batches[1:]]
+        summary = {
+            "source": self.source, "num_frames": len(names),
+            "rgb_sequence_sha256": hashlib.sha256("\n".join(names).encode()).hexdigest(),
+            "segmentation_complete": complete, "num_room_batches": len(self._batches),
+            "boundaries": boundaries, "batches": self._batches,
+            "num_assigned_frames": len(self._assigned_frames),
+            "unassigned_frame_count": len(names) - len(self._assigned_frames),
+            "overlapping_frame_assignments": sum(batch["num_frames"] for batch in self._batches)
+                                             - len(self._assigned_frames),
+        }
+        if self.boundary_plan is not None:
+            summary.update(boundary_file=self.boundary_plan.boundary_file,
+                           input_metadata=self.boundary_plan.metadata,
+                           configured_boundaries=list(self.boundary_plan.boundaries))
+        path = Path(output_folder) / "room_segmentation_summary.json"
+        path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        return summary
 
     def estimate_room_batch(self, img_path, logits, room_label, end_of_sequence=False):
         """
         Segments a sequence of images into rooms and doorways/corridors based on room_label predictions.
         Handles hysteresis (stability) and prevents empty batches for first frames.
         """
+        if self.source == "external":
+            return self._estimate_external_batch(img_path, end_of_sequence)
 
         # --- Determine if this frame is a corridor/doorway ---
         is_corridor = (room_label == self.method)

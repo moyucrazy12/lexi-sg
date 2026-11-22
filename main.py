@@ -9,6 +9,7 @@ from lexisg.tasks.object_segmentation import cross_room
 from lexisg.tasks.optimiser import Optimiser
 from lexisg.tasks.visualiser import Visualiser
 from lexisg.utils.data_loader import get_dataset
+from lexisg.utils.room_boundaries import load_external_boundaries, transition_source
 from lexisg.utils.config import get_path, get_object_segmentation_value, load_object_segmentation_service_config
 
 import numpy as np
@@ -54,8 +55,9 @@ def _apply_config_override(config, override):
 
 
 class LEXISG:
-    def __init__(self, config):
+    def __init__(self, config, boundary_plan=None):
         self.config = config
+        self.segmentation_source = transition_source(config["room_segmentation"])
         self.model_devices = dict(self.config.get("model_devices", {}))
         self.reconstruction_device = self._resolve_device(self.model_devices.get("reconstruction"))
         self.semantic_device = self._resolve_device(self.model_devices.get("semantic"))
@@ -76,12 +78,13 @@ class LEXISG:
         )
         self.conf_threshold = float(self.config["reconstruction"].get("conf_threshold", 0.0))
         self.boundary_pairs = self.config["room_segmentation"]["boundary_pairs"]
-        self.room_prompt_list = self.config["room_segmentation"]["room_prompt_list"]
-        self.room_txt_feat = self.sem_model.get_txt_feat(self.room_prompt_list)
+        self.room_prompt_list = self.config["room_segmentation"].get("room_prompt_list", [])
+        self.room_txt_feat = (self.sem_model.get_txt_feat(self.room_prompt_list)
+                              if self.segmentation_source == "native" else None)
 
 
         self.graph = Graph()
-        self.room_segmentation = RoomSegmentation(self.model, self.config)
+        self.room_segmentation = RoomSegmentation(self.model, self.config, boundary_plan=boundary_plan)
         self.loop_handler = LoopClosure(self.model, self.config)
         self.optimiser = Optimiser()
         self.visualiser = Visualiser()
@@ -128,6 +131,12 @@ class LEXISG:
         self.loop_handler.depth_scale = self.depth_scale
         self.loop_handler.conf_threshold = self.conf_threshold
         self.rgb_paths = sorted(dataset.get_rgb())
+        self.room_segmentation.configure_sequence(self.rgb_paths)
+        boundary_indices = (list(self.room_segmentation.boundary_plan.indices)
+                            if self.segmentation_source == "external" else "detected online")
+        print(f"Room transitions: source={self.segmentation_source}, "
+              f"boundary indices={boundary_indices}")
+        self.room_segmentation.save_summary(self.config["output_folder"])
         self.depth_paths, self.poses = self._load_optional_inputs(dataset)
         depth_by_rgb = dict(zip(self.rgb_paths, self.depth_paths)) if self.depth_paths else None
         pose_by_rgb = dict(zip(self.rgb_paths, self.poses)) if self.poses else None
@@ -141,8 +150,10 @@ class LEXISG:
             feat = self.sem_model.get_img_txt_feat([img_path])
             self.accumulated_feats.append(feat)
 
-            logits = self.sem_model.get_similarity(self.room_txt_feat, feat)
-            room_label = self.room_prompt_list[np.argmax(logits)]
+            logits, room_label = None, None
+            if self.segmentation_source == "native":
+                logits = self.sem_model.get_similarity(self.room_txt_feat, feat)
+                room_label = self.room_prompt_list[np.argmax(logits)]
 
             threshold_detected, batch, current_key = self.room_segmentation.estimate_room_batch(
                                             img_path, 
@@ -154,6 +165,8 @@ class LEXISG:
             if threshold_detected:
                 # Process batch and check for loop closures
                 active_idx = self._process_room_batch(batch, current_key, self.accumulated_feats, self.rgb_paths)
+                self.room_segmentation.record_batch(batch, current_key)
+                self.room_segmentation.save_summary(self.config["output_folder"])
                 merged_ids = self.loop_handler.run_pcd_overlap_check(
                     self.graph, self.accumulated_feats, self.rgb_paths, self.optimiser
                 )
@@ -169,12 +182,20 @@ class LEXISG:
 
         if threshold_detected and batch is not None:
             print("Final segment detected — processing remaining frames.")
-            active_idx = self._process_room_batch(batch[:-1], current_key, self.accumulated_feats, self.rgb_paths)
+            # Retain the native baseline's legacy trimming. External batches
+            # contain no look-ahead/overlap frame, so every final frame is kept.
+            final_batch = batch if self.segmentation_source == "external" else batch[:-1]
+            active_idx = self._process_room_batch(final_batch, current_key, self.accumulated_feats, self.rgb_paths)
+            self.room_segmentation.record_batch(final_batch, current_key)
+            self.room_segmentation.save_summary(self.config["output_folder"])
             if self.run_object_segmentation:
                 self._run_object_segmentation_for_updated_nodes([active_idx])
 
 
         output_folder = self.config["output_folder"]
+        summary = self.room_segmentation.save_summary(output_folder, complete=True)
+        print(f"Room batches: {summary['num_room_batches']}; "
+              f"used boundary indices: {[event['frame_index'] for event in summary['boundaries']]}")
         self.visualiser.save(self.graph, output_folder, save_segmented=self.run_object_segmentation)
         if self.run_object_segmentation and self.cross_room_cfg.get("enabled", False):
             self.visualiser.save_cross_room(output_folder, cross_room.associate(self.graph, self.cross_room_cfg))
@@ -408,12 +429,23 @@ def main():
     logger.remove()
     logger.add(lambda msg: print(msg, end=""), level=log_level, colorize=True)
 
+    data_path = os.path.abspath(config["data_path"])
+    if not os.path.isdir(data_path):
+        raise FileNotFoundError(f"Dataset directory does not exist: {data_path}")
+    rgb_paths = sorted(get_dataset(data_path).get_rgb())
+    if not rgb_paths:
+        raise ValueError(
+            f"No RGB images found in {data_path}. "
+            "Expected image files in rgb/ or directly in the dataset directory."
+        )
+    boundary_plan = load_external_boundaries(config["room_segmentation"], rgb_paths)
+
     output_folder = config.get("output_folder", "output")
     if os.path.exists(output_folder):
         shutil.rmtree(output_folder)
     os.makedirs(output_folder)
 
-    p = LEXISG(config)
+    p = LEXISG(config, boundary_plan=boundary_plan)
     p.run_batch()
 
     if args.visualise:

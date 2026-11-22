@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import torch 
 from PIL import Image
 import numpy as np
+from open_clip.tokenizer import default_bpe
 from dinov3.data.transforms import make_classification_eval_transform
 from dinov3.hub.dinotxt import dinov3_vitl16_dinotxt_tet1280d20h24l
 
@@ -13,10 +14,11 @@ _CHECKPOINTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".
 
 class Dino:
     def  __init__(self, device=None): 
-        print("Loading Dino")
+        print("Loading Dino", flush=True)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.img_txt_model, self.tokenizer= self._load_img_txt_model()
         self.image_preprocess = make_classification_eval_transform()
+        print(f"Dino loaded on {self.device}", flush=True)
 
     def _autocast_context(self):
         if self.device == "cuda":
@@ -83,7 +85,9 @@ class Dino:
             )
         )
 
-        load_kwargs = {}
+        # DINOv3 otherwise downloads this vocabulary on every startup without a
+        # timeout. open_clip already ships the identical CLIP vocabulary.
+        load_kwargs = {"bpe_path_or_url": default_bpe()}
         if backbone_weights is not None:
             load_kwargs["backbone_weights"] = backbone_weights
         if text_weights is not None:

@@ -10,6 +10,8 @@ reconstruction:
   pcd_voxel_size: 0.04   # saved room point clouds; loop_closure.voxel_size is separate
   batch_size: 60
 room_segmentation:
+  source: native  # native: DINO hysteresis; external: precomputed room-to-room cuts
+  boundary_file: null  # required for external; indices refer to sorted RGB files
   method: doorway
   transitions_as_nodes: true    # false: fold doorway frames into adjacent rooms (fewer nodes, faster; see PROGRESS.md)
   boundary_pairs: 2
